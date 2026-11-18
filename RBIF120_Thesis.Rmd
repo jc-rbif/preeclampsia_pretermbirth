@@ -1,0 +1,772 @@
+---
+title: "RBIF120_Thesis"
+author: "Josephine Colecraft"
+date: "2026-11-08"
+output: html_document
+---
+
+## Step 1: Preprocessing, normalization, and differential expression analysis
+
+I struggled to load the needed information from NCBI GEO Analyze with GEO2R script (due to reCAPTCHA errors) for example: 
+
+load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE190971", "file=GSE190971_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames="GeneID")
+
+load gene annotations 
+apath <- paste(urld, "type=rnaseq_counts", "file=Human.GRCh38.p13.annot.tsv.gz", sep="&")
+annot <- data.table::fread(apath, header=T, quote="", stringsAsFactors=F, data.table=F)
+rownames(annot) <- annot$GeneID
+
+
+so I manually downloaded the raw counts and human genome annotation files from the site to being analysis. 
+
+
+```{r Dataset pulling, message=FALSE, warning=FALSE}
+homedir <- "/Users/jo.lovelace/rbif120"
+
+ptb_raw_counts_table <- read.table(file.path(homedir, "preterm_raw_counts.tsv"), sep = "\t", header = TRUE)
+ptb_raw_counts <- file.path(homedir, "preterm_raw_counts.tsv")
+
+preec_raw_counts_table <- read.table(file.path(homedir, "preeclampsia_raw_counts.tsv"), sep = "\t", header = TRUE)
+preec_raw_counts <- file.path(homedir, "preeclampsia_raw_counts.tsv")
+
+human_genome <- file.path(homedir,"Human.GRCh38.p13.annot.tsv")
+
+```
+
+
+
+```{r Preterm birth dataset, message=FALSE, warning=FALSE}
+# Version info: R 4.2.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+################################################################
+
+library(DESeq2)
+library(data.table)
+library(pheatmap)
+
+#Load raw counts table
+ptb_data <- data.table::fread(ptb_raw_counts)
+
+# Extract gene identifiers
+ptb_gene_ids <- ptb_data$GeneID
+
+# Extract count columns
+ptb_count_data <- ptb_data[, !"GeneID", with = FALSE]
+
+# Convert to numeric matrix
+ptb_tbl <- as.matrix(ptb_count_data)
+storage.mode(ptb_tbl) <- "double"
+
+# Assign gene identifiers
+rownames(ptb_tbl) <- ptb_gene_ids
+
+############################################################
+#### Initial dataset assessment ############################
+############################################################
+
+ptb_initial_genes <- nrow(ptb_tbl)
+ptb_initial_samples <- ncol(ptb_tbl)
+
+# Missing values
+ptb_missing <- sum(is.na(ptb_tbl))
+
+# Duplicate gene identifiers
+ptb_duplicates <- sum(duplicated(rownames(ptb_tbl)))
+
+# Negative counts
+ptb_negative <- sum(ptb_tbl < 0, na.rm = TRUE)
+
+# Non-integer counts
+ptb_noninteger <- sum(
+  ptb_tbl %% 1 != 0,
+  na.rm = TRUE
+)
+
+# Initial QC summary
+ptb_initial_summary <- data.frame(
+  Metric = c(
+    "Initial genes",
+    "Initial samples",
+    "Missing values",
+    "Duplicate gene IDs",
+    "Negative counts",
+    "Non-integer counts"
+  ),
+  Value = c(
+    ptb_initial_genes,
+    ptb_initial_samples,
+    ptb_missing,
+    ptb_duplicates,
+    ptb_negative,
+    ptb_noninteger
+  )
+)
+
+print(ptb_initial_summary)
+
+# Validate count matrix before integer conversion
+stopifnot(all(is.finite(ptb_tbl)))
+stopifnot(all(ptb_tbl >= 0))
+stopifnot(all(ptb_tbl %% 1 == 0))
+stopifnot(!anyDuplicated(rownames(ptb_tbl)))
+stopifnot(!anyNA(rownames(ptb_tbl)))
+stopifnot(!any(rownames(ptb_tbl) == ""))
+
+# Convert to integer counts
+storage.mode(ptb_tbl) <- "integer"
+
+############################################################
+#### Library Sizes #########################################
+############################################################
+# Calculate total reads per sample
+library_sizes <- colSums(ptb_tbl)
+
+# Check for missing values
+sum(is.na(ptb_tbl))
+
+# Check library sizes
+summary(library_sizes)
+
+# Visualize library sizes
+barplot(library_sizes,
+        main = "Preterm Birth: Library Sizes",
+        ylab = "Total Counts",
+        las = 2,
+        col = "steelblue")
+
+############################################################
+#### Load gene annotations #################################
+############################################################
+ptb_annot <- data.table::fread(human_genome, header = TRUE, quote = "", stringsAsFactors = FALSE, data.table = FALSE)
+
+rownames(ptb_annot) <- ptb_annot$GeneID
+
+sum(duplicated(rownames(ptb_annot)))
+sum(rownames(ptb_tbl) %in% rownames(ptb_annot))
+
+# Sample selection
+ptb_gsms <- "00000000000000000000000111111111111111"
+ptb_sml <- strsplit(ptb_gsms, split = "")[[1]]
+
+# Group membership for samples
+ptb_gs <- factor(ptb_sml)
+# Verify number of group assignments matches sample count
+stopifnot(length(ptb_gs) == ncol(ptb_tbl))
+table(ptb_gs) # Check group sizes
+
+ptb_groups <- make.names(c("Ctrl", "Tx"))
+levels(ptb_gs) <- ptb_groups
+ptb_sample_info <- data.frame(Group = ptb_gs, row.names = colnames(ptb_tbl))
+
+ptb_sample_check <- data.frame(
+  Sample = colnames(ptb_tbl),
+  Group = ptb_gs
+)
+
+print(ptb_sample_check)
+
+############################################################
+#### Pre-filter low count genes ############################
+############################################################
+# Keep genes with at least N counts ,
+# where N = size of smallest group
+# Record initial number of genes
+ptb_genes_before <- nrow(ptb_tbl)
+ptb_samples_before <- ncol(ptb_tbl)
+
+# Apply low-count filtering
+ptb_keep <- rowSums(ptb_tbl >= 10) >= min(table(ptb_gs))
+
+ptb_tbl <- ptb_tbl[ptb_keep, ]
+
+# Record genes after filtering
+ptb_genes_after <- nrow(ptb_tbl)
+
+# Calculate genes removed
+ptb_genes_removed <- ptb_genes_before - ptb_genes_after
+
+# Calculate percentage removed
+ptb_percent_removed <- (
+  ptb_genes_removed / ptb_genes_before
+) * 100
+
+# Create before/after summary
+ptb_sample_summary <- data.frame(
+  Stage = c("Before filtering", "After filtering"),
+  Genes = c(ptb_genes_before, ptb_genes_after),
+  Samples = c(ptb_samples_before, ncol(ptb_tbl))
+)
+
+print(ptb_sample_summary)
+
+cat("Genes removed:", ptb_genes_removed, "\n")
+cat("Percentage removed:", round(ptb_percent_removed, 2), "%")
+
+barplot(
+  ptb_sample_summary$Genes,
+  names.arg = ptb_sample_summary$Stage,
+  main = "Preterm Birth: Genes Before and After Filtering",
+  ylab = "Number of Genes",
+  col = c("lightblue", "steelblue")
+)
+
+############################################################
+#### Create DESeq2 dataset #################################
+############################################################
+ptb_ds <- DESeqDataSetFromMatrix(countData = ptb_tbl, colData = ptb_sample_info, design = ~Group)
+ptb_ds <- DESeq(ptb_ds, test = "Wald", sfType = "poscounts")
+
+# Variance stabilizing transformation
+ptb_vsd <- vst(ptb_ds, blind = TRUE)
+
+# Examine DESeq2 normalization factors
+sizeFactors(ptb_ds)
+
+# Calculate normalized library sizes
+normalized_library_sizes <- colSums(
+  counts(ptb_ds, normalized = TRUE)
+)
+
+summary(normalized_library_sizes)
+
+############################################################
+#### PCA plot ##############################################
+############################################################
+plotPCA(ptb_vsd, intgroup = "Group")
+
+# Extract transformed expression data
+ptb_mat <- assay(ptb_vsd)
+
+# Calculate sample correlations
+ptb_cor <- cor(ptb_mat)
+
+# Generate heatmap
+pheatmap(ptb_cor,
+         main = "Preterm Birth Sample-to-Sample Correlation",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation")
+
+############################################################
+#### Extract results for top genes table ###################
+############################################################
+ptb_r <- results(ptb_ds,
+             contrast = c("Group", "Tx", "Ctrl"),
+             alpha = 0.05,
+             pAdjustMethod = "fdr")
+
+ptb_r <- ptb_r[!is.na(ptb_r$padj), ]
+
+############################################################
+#### Identify significantly upregulated genes ##############
+############################################################
+ptb_r_up <- ptb_r[ptb_r$padj < 0.05 & ptb_r$log2FoldChange > 1, ]
+ptb_tT_up <- ptb_r_up[order(ptb_r_up$padj), ]
+
+# Merge upregulated genes with annotations
+ptb_tT_up <- merge(as.data.frame(ptb_tT_up), ptb_annot, by = 0, sort = FALSE)
+
+# Rename merged gene column
+colnames(ptb_tT_up)[1] <- "GeneID"
+
+# Select desired columns
+ptb_tT_up <- subset(ptb_tT_up, select = c("GeneID", "padj", "pvalue",
+                            "lfcSE", "stat", "log2FoldChange",
+                            "baseMean", "Symbol", "Description"))
+
+# Extract upregulated gene symbols
+ptb_symbols_up <- unique(na.omit(ptb_tT_up$Symbol))
+print(length(ptb_symbols_up))
+
+# Export upregulated gene symbols
+writeLines(ptb_symbols_up, file.path(homedir, "ptb_up_gene_symbols.txt"))
+
+############################################################
+### Identify significantly downregulated genes #############
+############################################################
+ptb_r_down <- ptb_r[ptb_r$padj < 0.05 & ptb_r$log2FoldChange < -1, ]
+ptb_tT_down <- ptb_r_down[order(ptb_r_down$padj), ]
+
+# Merge downregulated genes with annotations
+ptb_tT_down <- merge(as.data.frame(ptb_tT_down), ptb_annot, by = 0, sort = FALSE)
+
+# Rename merged gene column
+colnames(ptb_tT_down)[1] <- "GeneID"
+
+# Select desired columns
+ptb_tT_down <- subset(ptb_tT_down, select = c("GeneID", "padj", "pvalue",
+                            "lfcSE", "stat", "log2FoldChange",
+                            "baseMean", "Symbol", "Description"))
+
+# Extract downregulated gene symbols
+ptb_symbols_down <- unique(na.omit(ptb_tT_down$Symbol))
+print(length(ptb_symbols_down))
+
+# Export downregulated gene symbols
+writeLines(ptb_symbols_down, file.path(homedir, "ptb_down_gene_symbols.txt"))
+```
+
+
+
+
+```{r Preeclampsia dataset, message=FALSE, warning=FALSE}
+# Version info: R 4.2.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+################################################################
+
+library(DESeq2)
+library(data.table)
+library(pheatmap)
+
+#Load raw counts table
+preec_data <- data.table::fread(preec_raw_counts)
+
+# Extract gene identifiers
+preec_gene_ids <- preec_data$GeneID
+
+# Extract count columns
+preec_count_data <- preec_data[, !"GeneID", with = FALSE]
+
+# Convert to numeric matrix
+preec_tbl <- as.matrix(preec_count_data)
+storage.mode(preec_tbl) <- "double"
+
+# Assign gene identifiers
+rownames(preec_tbl) <- preec_gene_ids
+
+############################################################
+#### Initial dataset assessment ############################
+############################################################
+
+preec_initial_genes <- nrow(preec_tbl)
+preec_initial_samples <- ncol(preec_tbl)
+
+# Missing values
+preec_missing <- sum(is.na(preec_tbl))
+
+# Duplicate gene identifiers
+preec_duplicates <- sum(duplicated(rownames(preec_tbl)))
+
+# Negative counts
+preec_negative <- sum(preec_tbl < 0, na.rm = TRUE)
+
+# Non-integer counts
+preec_noninteger <- sum(
+  preec_tbl %% 1 != 0,
+  na.rm = TRUE
+)
+
+# Initial QC summary
+preec_initial_summary <- data.frame(
+  Metric = c(
+    "Initial genes",
+    "Initial samples",
+    "Missing values",
+    "Duplicate gene IDs",
+    "Negative counts",
+    "Non-integer counts"
+  ),
+  Value = c(
+    preec_initial_genes,
+    preec_initial_samples,
+    preec_missing,
+    preec_duplicates,
+    preec_negative,
+    preec_noninteger
+  )
+)
+
+print(preec_initial_summary)
+
+# Validate count matrix before integer conversion
+stopifnot(all(is.finite(preec_tbl)))
+stopifnot(all(preec_tbl >= 0))
+stopifnot(all(preec_tbl %% 1 == 0))
+stopifnot(!anyDuplicated(rownames(preec_tbl)))
+stopifnot(!anyNA(rownames(preec_tbl)))
+stopifnot(!any(rownames(preec_tbl) == ""))
+
+# Convert to integer counts
+storage.mode(preec_tbl) <- "integer"
+
+############################################################
+#### Library Sizes #########################################
+############################################################
+# Calculate total reads per sample
+preec_library_sizes <- colSums(preec_tbl)
+
+# Check for missing values
+sum(is.na(preec_tbl))
+
+# Check library sizes
+summary(preec_library_sizes)
+
+# Visualize library sizes
+barplot(preec_library_sizes,
+        main = "Preeclampsia: Library Sizes",
+        ylab = "Total Counts",
+        las = 2,
+        col = "steelblue")
+
+############################################################
+#### Load gene annotations #################################
+############################################################
+preec_annot <- data.table::fread(human_genome, header = TRUE, quote = "", stringsAsFactors = FALSE, data.table = FALSE)
+
+rownames(preec_annot) <- preec_annot$GeneID
+
+sum(duplicated(rownames(preec_annot)))
+stopifnot(!anyDuplicated(preec_annot$GeneID))
+stopifnot(!anyNA(preec_annot$GeneID))
+
+sum(rownames(preec_tbl) %in% rownames(preec_annot))
+
+# Sample selection
+preec_gsms <- "00000011111112222224444444433333355555555"
+preec_sml <- strsplit(preec_gsms, split = "")[[1]]
+
+# Group membership for samples
+preec_gs <- factor(preec_sml)
+# Verify number of group assignments matches sample count
+stopifnot(length(preec_gs) == ncol(preec_tbl))
+table(preec_gs) # Check group sizes
+
+preec_groups <- make.names(c("Placenta_Ctrl", "Placenta_Tx", "MedLarge_Ctrl", "MedLarge_Tx", "Small_Ctrl", "Small_Tx"))
+levels(preec_gs) <- preec_groups
+preec_sample_info <- data.frame(Group = preec_gs, row.names = colnames(preec_tbl))
+
+preec_sample_check <- data.frame(
+  Sample = colnames(preec_tbl),
+  Group = preec_gs
+)
+
+print(preec_sample_check)
+
+############################################################
+#### Pre-filter low count genes ############################
+############################################################
+# Keep genes with at least N counts ,
+# where N = size of smallest group
+# Record initial number of genes
+preec_genes_before <- nrow(preec_tbl)
+preec_samples_before <- ncol(preec_tbl)
+
+# Apply low-count filtering
+preec_keep <- rowSums(preec_tbl >= 10) >= min(table(preec_gs))
+
+preec_tbl <- preec_tbl[preec_keep, ]
+
+# Record genes after filtering
+preec_genes_after <- nrow(preec_tbl)
+
+# Calculate genes removed
+preec_genes_removed <- preec_genes_before - preec_genes_after
+
+# Calculate percentage removed
+preec_percent_removed <- (
+  preec_genes_removed / preec_genes_before
+) * 100
+
+# Create before/after summary
+preec_sample_summary <- data.frame(
+  Stage = c("Before filtering", "After filtering"),
+  Genes = c(preec_genes_before, preec_genes_after),
+  Samples = c(preec_samples_before, ncol(preec_tbl))
+)
+
+print(preec_sample_summary)
+
+cat("Genes removed:", preec_genes_removed, "\n")
+cat("Percentage removed:", round(preec_percent_removed, 2), "%")
+
+barplot(
+  preec_sample_summary$Genes,
+  names.arg = preec_sample_summary$Stage,
+  main = "Preeclampsia: Genes Before and After Filtering",
+  ylab = "Number of Genes",
+  col = c("lightblue", "steelblue")
+)
+
+############################################################
+#### Create DESeq2 dataset #################################
+############################################################
+preec_ds <- DESeqDataSetFromMatrix(countData = preec_tbl, colData = preec_sample_info, design = ~Group)
+preec_ds <- DESeq(preec_ds, test = "Wald", sfType = "poscounts")
+
+# Variance stabilizing transformation
+preec_vsd <- vst(preec_ds, blind = TRUE)
+
+# Examine DESeq2 normalization factors
+sizeFactors(preec_ds)
+
+# Calculate normalized library sizes
+preec_normalized_library_sizes <- colSums(
+  counts(preec_ds, normalized = TRUE)
+)
+
+summary(preec_normalized_library_sizes)
+
+############################################################
+#### PCA plot ##############################################
+############################################################
+plotPCA(preec_vsd, intgroup = "Group")
+
+# Extract transformed expression data
+preec_mat <- assay(preec_vsd)
+
+# Calculate sample correlations
+preec_cor <- cor(preec_mat)
+
+# Generate heatmap
+pheatmap(preec_cor,
+         main = "Preeclampsia Sample-to-Sample Correlation",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation")
+
+############################################################
+#### Placenta: Differential Expression Analysis ############
+############################################################
+
+preec_r_placenta <- results(preec_ds,contrast = c("Group", "Placenta_Tx", "Placenta_Ctrl"), alpha = 0.05)
+
+preec_r_medlarge <- results(preec_ds,contrast = c("Group", "MedLarge_Tx", "MedLarge_Ctrl"), alpha = 0.05)
+
+preec_r_small <- results(preec_ds,contrast = c("Group", "Small_Tx", "Small_Ctrl"), alpha = 0.05)
+
+# Remove genes without adjusted p-values
+preec_r_placenta <- preec_r_placenta[ !is.na(preec_r_placenta$padj),]
+preec_r_medlarge <- preec_r_medlarge[ !is.na(preec_r_medlarge$padj),]
+preec_r_small <- preec_r_small[ !is.na(preec_r_small$padj),]
+
+############################################################
+#### Identify significantly upregulated genes ##############
+############################################################
+
+######## Placenta Group ####################################
+preec_up_placenta <- preec_r_placenta[ preec_r_placenta$padj < 0.05 & preec_r_placenta$log2FoldChange > 1,]
+
+preec_up_placenta <- as.data.frame(preec_up_placenta)
+
+# Add gene identifiers
+preec_up_placenta$GeneID <- rownames(preec_up_placenta)
+
+# Merge with gene annotations
+preec_up_placenta <- merge(preec_up_placenta,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_up_placenta <- preec_up_placenta[order(preec_up_placenta$padj),]
+
+# Select desired columns
+preec_up_placenta <- subset(preec_up_placenta,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_up_placenta <- unique(na.omit(preec_up_placenta$Symbol))
+print(length(preec_symbols_up_placenta))
+
+# Export gene symbols
+writeLines(preec_symbols_up_placenta,file.path(homedir, "preec_up_placenta_gene_symbols.txt"))
+
+######## MedLarge Group ####################################
+preec_up_medlarge <- preec_r_medlarge[ preec_r_medlarge$padj < 0.05 & preec_r_medlarge$log2FoldChange > 1,]
+
+preec_up_medlarge <- as.data.frame(preec_up_medlarge)
+
+# Add gene identifiers
+preec_up_medlarge$GeneID <- rownames(preec_up_medlarge)
+
+# Merge with gene annotations
+preec_up_medlarge <- merge(preec_up_medlarge,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_up_medlarge <- preec_up_medlarge[order(preec_up_medlarge$padj),]
+
+# Select desired columns
+preec_up_medlarge <- subset(preec_up_medlarge,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_up_medlarge <- unique(na.omit(preec_up_medlarge$Symbol))
+print(length(preec_symbols_up_medlarge))
+
+# Export gene symbols
+writeLines(preec_symbols_up_medlarge,file.path(homedir, "preec_up_medlarge_gene_symbols.txt"))
+
+
+######## Small Group ####################################
+preec_up_small <- preec_r_small[ preec_r_small$padj < 0.05 & preec_r_small$log2FoldChange > 1,]
+
+preec_up_small <- as.data.frame(preec_up_small)
+
+# Add gene identifiers
+preec_up_small$GeneID <- rownames(preec_up_small)
+
+# Merge with gene annotations
+preec_up_small <- merge(preec_up_small,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_up_small <- preec_up_small[order(preec_up_small$padj),]
+
+# Select desired columns
+preec_up_small <- subset(preec_up_small,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_up_small <- unique(na.omit(preec_up_small$Symbol))
+print(length(preec_symbols_up_small))
+
+# Export gene symbols
+writeLines(preec_symbols_up_small,file.path(homedir, "preec_up_small_gene_symbols.txt"))
+
+############################################################
+#### Identify significantly downregulated genes ############
+############################################################
+
+######## Placenta Group ####################################
+preec_down_placenta <- preec_r_placenta[preec_r_placenta$padj < 0.05 & preec_r_placenta$log2FoldChange < -1,]
+
+preec_down_placenta <- as.data.frame(preec_down_placenta)
+
+# Add gene identifiers
+preec_down_placenta$GeneID <- rownames(preec_down_placenta)
+
+# Merge with gene annotations
+preec_down_placenta <- merge(preec_down_placenta,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_down_placenta <- preec_down_placenta[order(preec_down_placenta$padj),]
+
+# Select desired columns
+preec_down_placenta <- subset(preec_down_placenta,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_down_placenta <- unique(na.omit(preec_down_placenta$Symbol))
+print(length(preec_symbols_down_placenta))
+
+# Export gene symbols
+writeLines(preec_symbols_down_placenta,file.path(homedir, "preec_down_placenta_gene_symbols.txt"))
+
+######## MedLarge Group ####################################
+preec_down_medlarge <- preec_r_medlarge[preec_r_medlarge$padj < 0.05 & preec_r_medlarge$log2FoldChange < -1,]
+
+preec_down_medlarge <- as.data.frame(preec_down_medlarge)
+
+# Add gene identifiers
+preec_down_medlarge$GeneID <- rownames(preec_down_medlarge)
+
+# Merge with gene annotations
+preec_down_medlarge <- merge(preec_down_medlarge,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_down_medlarge <- preec_down_medlarge[order(preec_down_medlarge$padj),]
+
+# Select desired columns
+preec_down_medlarge <- subset(preec_down_medlarge,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_down_medlarge <- unique(na.omit(preec_down_medlarge$Symbol))
+print(length(preec_symbols_down_medlarge))
+
+# Export gene symbols
+writeLines(preec_symbols_down_medlarge,file.path(homedir, "preec_down_medlarge_gene_symbols.txt"))
+
+######## Small Group ####################################
+preec_down_small <- preec_r_small[preec_r_small$padj < 0.05 & preec_r_small$log2FoldChange < -1,]
+
+preec_down_small <- as.data.frame(preec_down_small)
+
+# Add gene identifiers
+preec_down_small$GeneID <- rownames(preec_down_small)
+
+# Merge with gene annotations
+preec_down_small <- merge(preec_down_small,preec_annot,by = "GeneID",sort = FALSE)
+
+# Order by adjusted p-value
+preec_down_small <- preec_down_small[order(preec_down_small$padj),]
+
+# Select desired columns
+preec_down_small <- subset(preec_down_small,select = c(
+    "GeneID", "padj", "pvalue", "lfcSE",
+    "stat", "log2FoldChange", "baseMean",
+    "Symbol", "Description"
+  ))
+
+# Extract gene symbols
+preec_symbols_down_small <- unique(na.omit(preec_down_small$Symbol))
+cat("preec_symbols_down_small", length(preec_symbols_down_small), "\n")
+
+# Export gene symbols
+writeLines(preec_symbols_down_small,file.path(homedir, "preec_down_small_gene_symbols.txt"))
+```
+
+
+
+
+
+cat("preec_symbols_down_small genes:", length(preec_symbols_down_small), "\n")
+
+
+
+
+
+
+
+
+
+
+
+## Step 2: Finding overlapping genes between the preterm birth and preeclampsia datasets
+
+```{r finding overlapping genes}
+
+```
+
+
+
+```{r VennDiagram}
+library(ggVennDiagram)
+
+```
+
+## Step 3: Analysis on the overlapping genes via GSEA
+
+
+## Step 4: Analysis of common transcription factors via LISA
+
+```{r common transcription factors via LISA, message=FALSE, warning=FALSE}
+library(readr)
+
+```
+
+## Step 5: Analysis of common (upstream?) TFs via Cistrome DB Toolkit
+
+
+```{r common upstream TFs via Cistrome DB Toolkit}
+library(readr)
+
+```
+
+
+```{r common_TFs}
+
+```
+
+
+
